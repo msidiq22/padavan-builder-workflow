@@ -1,0 +1,257 @@
+name: Build firmware - Custom build.config
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: registry.gitlab.com/hadzhioglu/padavan-ng
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      PADAVAN_REPO: https://github.com/TWShiyuLiou1997/padavan-ng.git
+      PADAVAN_BRANCH: master
+      PADAVAN_COMMIT: HEAD
+      PADAVAN_TOOLCHAIN_URL: https://gitlab.com/api/v4/projects/hadzhioglu%2Fpadavan-ng/packages/generic/toolchain/latest/toolchain.tzst
+      TZ: Asia/Jakarta
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -e
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            tzdata autoconf autoconf-archive automake autopoint bison build-essential \
+            ca-certificates cmake cpio curl dos2unix doxygen fakeroot flex gawk gettext git gperf \
+            help2man htop kmod libarchive-tools libblkid-dev libc-ares-dev libcurl4-openssl-dev \
+            libdevmapper-dev libev-dev libevent-dev libexif-dev libflac-dev libgmp3-dev \
+            libid3tag0-dev libidn2-dev libjpeg-dev libkeyutils-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses5-dev libogg-dev libsqlite3-dev libssl-dev libsystemd-dev \
+            libtool libtool-bin libudev-dev libunbound-dev libvorbis-dev libxml2-dev locales \
+            mc nano pkg-config ppp-dev python3 python3-docutils sshpass texinfo unzip uuid \
+            uuid-dev vim wget xxd zlib1g-dev jq zip rsync
+
+          ln -fs /usr/share/zoneinfo/Asia/Jakarta /etc/localtime
+          dpkg-reconfigure -f noninteractive tzdata
+
+          echo "=== Host tools ==="
+          autoconf --version | head -n 1
+          automake --version | head -n 1
+          help2man --version | head -n 1
+          m4 --version | head -n 1
+          makeinfo --version | head -n 1
+
+      - name: Validate custom build.config
+        run: |
+          set -e
+
+          test -s build.config || {
+            echo "ERROR: build.config tidak ditemukan atau kosong."
+            exit 1
+          }
+
+          sed -i 's/\r$//' build.config
+
+          get_cfg() {
+            local key="$1"
+            grep -E "^${key}=" build.config | tail -n 1 | sed -E 's/^[^=]+=//' | sed 's/^"//; s/"$//'
+          }
+
+          CONFIG_VENDOR="$(get_cfg CONFIG_VENDOR)"
+          CONFIG_PRODUCT="$(get_cfg CONFIG_PRODUCT)"
+          CONFIG_FIRMWARE_PRODUCT_ID="$(get_cfg CONFIG_FIRMWARE_PRODUCT_ID)"
+
+          test -n "$CONFIG_VENDOR" || { echo "ERROR: CONFIG_VENDOR tidak ada."; exit 1; }
+          test -n "$CONFIG_PRODUCT" || { echo "ERROR: CONFIG_PRODUCT tidak ada."; exit 1; }
+          test -n "$CONFIG_FIRMWARE_PRODUCT_ID" || { echo "ERROR: CONFIG_FIRMWARE_PRODUCT_ID tidak ada."; exit 1; }
+
+          echo "CONFIG_VENDOR=$CONFIG_VENDOR" >> "$GITHUB_ENV"
+          echo "CONFIG_PRODUCT=$CONFIG_PRODUCT" >> "$GITHUB_ENV"
+          echo "CONFIG_FIRMWARE_PRODUCT_ID=$CONFIG_FIRMWARE_PRODUCT_ID" >> "$GITHUB_ENV"
+
+          echo "=== Custom build target ==="
+          echo "Vendor      : $CONFIG_VENDOR"
+          echo "Product     : $CONFIG_PRODUCT"
+          echo "Product ID  : $CONFIG_FIRMWARE_PRODUCT_ID"
+          echo
+          echo "=== Requested firmware features ==="
+          grep -E '^CONFIG_FIRMWARE_(ENABLE|INCLUDE)_[A-Za-z0-9_]+=y$' build.config || true
+          grep -E '^CONFIG_CC_OPTIMIZE_FOR_SIZE=y$' build.config || true
+
+      - name: Download Padavan source and toolchain
+        run: |
+          set -e
+          git config --global --add safe.directory '*'
+
+          rm -rf padavan-ng
+          git clone -b "$PADAVAN_BRANCH" "$PADAVAN_REPO" padavan-ng
+
+          if [ "$PADAVAN_COMMIT" != "HEAD" ] && [ -n "$PADAVAN_COMMIT" ]; then
+            git -C padavan-ng checkout "$PADAVAN_COMMIT"
+          fi
+
+          wget -qO- "$PADAVAN_TOOLCHAIN_URL" | tar -C padavan-ng --zstd -xf -
+
+          echo "=== Padavan source ==="
+          git -C padavan-ng rev-parse HEAD
+
+      - name: Validate target board files
+        run: |
+          set -e
+
+          BOARD_DIR="padavan-ng/trunk/configs/boards/$CONFIG_VENDOR/$CONFIG_FIRMWARE_PRODUCT_ID"
+
+          echo "Board directory: $BOARD_DIR"
+
+          test -d "$BOARD_DIR" || {
+            echo "ERROR: Board directory tidak ditemukan: $BOARD_DIR"
+            echo "Periksa CONFIG_VENDOR dan CONFIG_FIRMWARE_PRODUCT_ID pada build.config."
+            exit 1
+          }
+
+          test -f "$BOARD_DIR/partitions.config" || {
+            echo "ERROR: partitions.config tidak ditemukan."
+            exit 1
+          }
+
+          test -f "$BOARD_DIR/kernel-3.4.x.config" || {
+            echo "ERROR: kernel-3.4.x.config tidak ditemukan."
+            exit 1
+          }
+
+      - name: Apply custom config as authoritative .config
+        run: |
+          set -e
+
+          cp build.config padavan-ng/trunk/.config
+          sed -i 's/\r$//' padavan-ng/trunk/.config
+
+          echo "=== Active firmware config ==="
+          grep -E '^CONFIG_(VENDOR|PRODUCT|FIRMWARE_PRODUCT_ID)=' padavan-ng/trunk/.config
+
+          echo
+          echo "=== Enabled firmware features ==="
+          grep -E '^CONFIG_FIRMWARE_(ENABLE|INCLUDE)_[A-Za-z0-9_]+=y$' padavan-ng/trunk/.config || true
+
+      - name: Verify cross compiler
+        run: |
+          set -e
+
+          COMPILER="$(pwd)/padavan-ng/toolchain/out/bin/mipsel-linux-uclibc-gcc"
+          UCLIBC="$(pwd)/padavan-ng/toolchain/out/mipsel-linux-uclibc/sysroot/lib/libuClibc-1.0.52.so"
+
+          test -x "$COMPILER" || {
+            echo "ERROR: Cross compiler tidak ditemukan: $COMPILER"
+            find padavan-ng/toolchain/out/bin -maxdepth 1 -type f -name '*mipsel*' | head -n 50 || true
+            exit 1
+          }
+
+          test -f "$UCLIBC" || {
+            echo "ERROR: uClibc tidak ditemukan: $UCLIBC"
+            exit 1
+          }
+
+          export PATH="$(pwd)/padavan-ng/toolchain/out/bin:$PATH"
+
+          echo "=== Cross compiler ==="
+          command -v mipsel-linux-uclibc-gcc
+          mipsel-linux-uclibc-gcc --version | head -n 1
+
+          echo "=== uClibc ==="
+          ls -lh "$UCLIBC"
+
+      - name: Build firmware using custom config
+        working-directory: padavan-ng/trunk
+        run: |
+          set -euo pipefail
+
+          export PATH="$GITHUB_WORKSPACE/padavan-ng/toolchain/out/bin:$PATH"
+          unset CROSS_COMPILE CC CXX LD AR AS RANLIB STRIP OBJCOPY OBJDUMP CONFIG_TOOLCHAIN_DIR || true
+
+          # clear_tree.sh dibolehkan membersihkan hasil build lama, tetapi
+          # .config custom dipasang kembali sesudahnya agar tetap menjadi konfigurasi final.
+          ./clear_tree.sh > /dev/null 2>&1 || true
+          rm -rf tmp staging
+          cp "$GITHUB_WORKSPACE/build.config" .config
+
+          echo "=== Final .config before build ==="
+          grep -E '^CONFIG_(VENDOR|PRODUCT|FIRMWARE_PRODUCT_ID)=' .config
+          echo
+          grep -E '^CONFIG_FIRMWARE_(ENABLE|INCLUDE)_[A-Za-z0-9_]+=y$' .config || true
+
+          echo
+          echo "=== Starting firmware build ==="
+          ./build_firmware.sh 2>&1 | tee build.log
+
+      - name: Check firmware size and collect output
+        run: |
+          set -e
+
+          mkdir -p output_pack
+
+          cp build.config output_pack/build.config
+          cp padavan-ng/trunk/build.log output_pack/build.log 2>/dev/null || true
+          cp padavan-ng/trunk/.config output_pack/final.config 2>/dev/null || true
+          cp padavan-ng/trunk/configs/boards/$CONFIG_VENDOR/$CONFIG_FIRMWARE_PRODUCT_ID/partitions.config output_pack/partitions.config
+          cp padavan-ng/trunk/configs/boards/$CONFIG_VENDOR/$CONFIG_FIRMWARE_PRODUCT_ID/kernel-3.4.x.config output_pack/kernel.config
+
+          shopt -s nullglob
+          images=(padavan-ng/trunk/images/*.trx padavan-ng/trunk/images/*.bin)
+
+          if [ ${#images[@]} -eq 0 ]; then
+            echo "ERROR: Tidak ditemukan file firmware .trx/.bin di trunk/images."
+            find padavan-ng/trunk/images -maxdepth 2 -type f -printf '%p %s bytes\n' 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "=== Firmware images ==="
+          for img in "${images[@]}"; do
+            size=$(stat -c '%s' "$img")
+            echo "$(basename "$img"): $size bytes"
+            cp "$img" output_pack/
+          done
+
+          # MR3020 V3 memakai layout 8M. Gunakan batas konservatif agar hasil
+          # tidak mendekati batas flash secara berlebihan.
+          if [ "$CONFIG_FIRMWARE_PRODUCT_ID" = "TL_MR3020-V3" ]; then
+            for img in output_pack/*.trx output_pack/*.bin; do
+              [ -f "$img" ] || continue
+              size=$(stat -c '%s' "$img")
+              max=$((7800 * 1024))
+              if [ "$size" -gt "$max" ]; then
+                echo "ERROR: Firmware terlalu besar untuk batas konservatif MR3020 V3: $size > $max bytes"
+                exit 1
+              fi
+            done
+          fi
+
+          zip -j "padavan_${CONFIG_VENDOR}_${CONFIG_FIRMWARE_PRODUCT_ID}_custom.zip" output_pack/*
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: padavan_${{ env.CONFIG_VENDOR }}_${{ env.CONFIG_FIRMWARE_PRODUCT_ID }}_custom
+          path: padavan_${{ env.CONFIG_VENDOR }}_${{ env.CONFIG_FIRMWARE_PRODUCT_ID }}_custom.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload debug logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: |
+            padavan-ng/trunk/build.log
+            output_pack/final.config
+            output_pack/build.config
+          if-no-files-found: ignore
+          retention-days: 7
